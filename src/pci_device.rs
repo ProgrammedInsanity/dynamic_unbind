@@ -1,22 +1,62 @@
-use core::error;
 use log::{error, info, warn};
-use log_derive::logfn;
-use std::{
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-};
-use tracing::instrument;
+use std::path::{Path, PathBuf};
 
-use crate::{kernel_modules, libvirt_xml};
+use crate::{kernel_modules, libvirt_xml, nvidia};
 #[derive(Debug, Clone)]
 pub struct PCIDevice {
-    pci_addr: String,                      // domain:bus:slot.function
-    driver: Option<PathBuf>,               // example: /sys/bus/pci/drivers/nvidia
-    dri_device_path: Option<PathBuf>,      // example: /dev/dri/card0
-    dri_render_path: Option<PathBuf>,      // example: /dev/dri/renderD128
-    nvidia_device_path: Option<PathBuf>,   // for NVIDIA proprietary driver. example: /dev/nvidia0
-    user_specified_driver: Option<String>, // Driver specified by the user to be loaded on the device after VM shutdown
-    driver_finder_on_shutdown_method: libvirt_xml::DriverFinderOnShutdownMethod, // used to tell the program which method to use to find the correct driver to load unto the gpu
+    /// domain:bus:slot.function
+    pub pci_addr: String,
+    /// example: /sys/bus/pci/drivers/nvidia
+    pub driver: Option<PathBuf>,
+    /// example: /dev/dri/card0
+    pub dri_device_path: Option<PathBuf>,
+    /// example: /dev/dri/renderD128
+    pub dri_render_path: Option<PathBuf>,
+    /// for NVIDIA proprietary driver. example: /dev/nvidia0
+    pub nvidia_device_path: Option<PathBuf>,
+    /// Driver specified by the user to be loaded on the device after VM shutdown
+    pub user_specified_driver: Option<String>,
+    /// Used to tell the program which method to use to find the correct driver to load onto the GPU
+    pub driver_finder_on_shutdown_method: libvirt_xml::DriverFinderOnShutdownMethod,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("User-specified driver '{driver}' does not exist")]
+    UserSpecifiedDriverDoesNotExist { driver: String },
+    #[error("Failed to kill processes using PCI device files: {0}")]
+    FailedToKillProcesses(#[from] crate::processes::Error),
+    #[error("Kernel module operation failed: {0}")]
+    KMod(#[from] crate::kernel_modules::Error),
+
+    #[error("Failed to write to driver_override for PCI device {pci_addr}: {io_error}")]
+    FailedToWriteToDriverOverride {
+        pci_addr: String,
+        io_error: std::io::Error,
+    },
+    #[error("Driver unbind path does not exist: {path}")]
+    UnbindPathNotPresent { path: PathBuf },
+
+    #[error("Failed to write to driver unbind for PCI device {pci_addr}: {io_error}")]
+    FailedToWriteToDriverUnbind {
+        pci_addr: String,
+        io_error: std::io::Error,
+    },
+    #[error("Failed to write to drivers_probe for PCI device {pci_addr}: {io_error}")]
+    FailedToWriteToDriverProbe {
+        pci_addr: String,
+        io_error: std::io::Error,
+    },
+    #[error("DRI device path not found for PCI device {pci_addr}")]
+    DriDevicePathNotFound { pci_addr: String },
+    #[error("DRM uevent path not found: {path} for PCI device {pci_addr}")]
+    DrmUeventPathNotFound { path: PathBuf, pci_addr: String },
+    #[error("Failed to write '{content}' to uevent file {path}: {io_error}")]
+    FailedToWriteToUeventFile {
+        path: PathBuf,
+        content: String,
+        io_error: std::io::Error,
+    },
 }
 
 impl PCIDevice {
@@ -25,7 +65,8 @@ impl PCIDevice {
         pci_addr: String,
         user_specified_driver: Option<String>,
         driver_finder_on_shutdown_method: libvirt_xml::DriverFinderOnShutdownMethod,
-    ) -> PCIDevice {
+    ) -> Result<PCIDevice, Error> {
+        use crate::dri::{get_dri_device_path, get_dri_render_path};
         let driver = get_driver_path(&pci_addr);
 
         let dri_device_path = match get_dri_device_path(&pci_addr) {
@@ -54,7 +95,7 @@ impl PCIDevice {
             }
         };
 
-        let nvidia_device_path = match get_nvidia_device_path(&pci_addr) {
+        let nvidia_device_path = match nvidia::get_nvidia_device_path(&pci_addr) {
             Ok(path) => Some(path),
             Err(error) => {
                 if let Some(driver) = driver.clone()
@@ -69,21 +110,15 @@ impl PCIDevice {
 
         if driver_finder_on_shutdown_method
             == libvirt_xml::DriverFinderOnShutdownMethod::UserSpecified
+            && let Some(ref user_driver) = user_specified_driver
+            && !kernel_modules::kmod_exists(user_driver)
         {
-            if let Some(ref user_driver) = user_specified_driver {
-                if !kernel_modules::module_exists(user_driver) {
-                    error!(
-                        "User specified driver module '{user_driver}' does not exist in the system"
-                    );
-                }
-            } else {
-                error!(
-                    "Driver finder method is set to UserSpecified but no user_specified_driver was provided"
-                );
-            }
+            return Err(Error::UserSpecifiedDriverDoesNotExist {
+                driver: user_driver.clone(),
+            });
         }
 
-        PCIDevice {
+        Ok(PCIDevice {
             pci_addr,
             driver,
             dri_device_path,
@@ -91,146 +126,125 @@ impl PCIDevice {
             nvidia_device_path,
             driver_finder_on_shutdown_method,
             user_specified_driver,
-        }
+        })
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn unbind_from_driver(&self) -> Result<(), ()> {
+    pub fn unbind_from_driver(&self) -> Result<(), Error> {
         use crate::processes;
 
         if self.driver.is_none() {
-            error!("");
-            return Err(());
+            return Ok(());
         }
 
-        let mut files: Vec<PathBuf> = vec![];
+        let mut files: Vec<&PathBuf> = vec![];
         if let Some(dri_device_path) = &self.dri_device_path {
-            files.push(dri_device_path.clone());
+            files.push(dri_device_path);
         }
         if let Some(dri_render_path) = &self.dri_render_path {
-            files.push(dri_render_path.clone());
+            files.push(dri_render_path);
         }
         if let Some(nvidia_device_path) = &self.nvidia_device_path {
-            files.push(nvidia_device_path.clone());
+            files.push(nvidia_device_path);
         }
 
         info!("Killing processes using these files: {files:#?}");
 
-        // processes::kill_processes_using_files(&files);
-
-        let pids: Vec<sysinfo::Pid> = files
-            .iter()
-            .flat_map(|file| processes::get_pids_via_procfs(file))
-            .flatten()
-            .collect();
-
-        if pids.is_empty() {
-            error!("");
-            return Err(());
-        }
+        processes::kill_processes_using_files(&files)?;
 
         if let driver_name = self
             .driver
             .as_ref()
-            .unwrap()
+            .expect("PCI device is missing an associated driver path")
             .file_name()
-            .unwrap()
+            .expect("Driver path is missing a file name component")
             .to_str()
-            .unwrap()
+            .expect("Driver name is not valid UTF-8")
             && driver_name == "nvidia"
         {
-            let err = kernel_modules::unload_kmod(driver_name);
-            error!("");
-            return Err(());
-        } else {
-            pci_device_detatch(&self.pci_addr);
+            kernel_modules::unload_kmod(driver_name)?;
         }
 
+        self.pci_device_bind_with_driver_override("vfio-pci")?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn write_to_driver_override(&self, driver_name: &str) -> Result<(), Error> {
+        use std::fs::write;
+        let path = Path::new("/sys/bus/pci/devices/")
+            .join(&self.pci_addr)
+            .join("driver_override");
+
+        write(path, driver_name).map_err(|error| Error::FailedToWriteToDriverOverride {
+            pci_addr: self.pci_addr.clone(),
+            io_error: error,
+        })?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn pci_device_bind_with_driver_override(&self, driver_name: &str) -> Result<(), Error> {
+        self.write_to_driver_override(driver_name)?;
+
+        self.pci_device_rebind()?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn pci_device_unbind(&self) -> Result<(), Error> {
+        use std::fs::write;
+        let driver = get_driver_path(&self.pci_addr);
+        if driver.is_none() {
+            return Ok(());
+        }
+
+        let unbind_path = driver
+            .as_ref()
+            .expect("PCI device driver path missing when unbinding")
+            .join("unbind");
+
+        if !unbind_path.exists() {
+            return Err(Error::UnbindPathNotPresent { path: unbind_path });
+        }
+
+        write(unbind_path, &self.pci_addr).map_err(|error| Error::FailedToWriteToDriverUnbind {
+            pci_addr: self.pci_addr.clone(),
+            io_error: error,
+        })?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    fn pci_device_rebind(&self) -> Result<(), Error> {
+        use std::fs::write;
+        self.pci_device_unbind()?;
+        write("/sys/bus/pci/drivers_probe", &self.pci_addr).map_err(|error| {
+            Error::FailedToWriteToDriverProbe {
+                pci_addr: self.pci_addr.clone(),
+                io_error: error,
+            }
+        })?;
 
         Ok(())
     }
 }
 
-fn pci_device_detatch(pci_addr: &str) {
-
-}
-
-#[derive(thiserror::Error, Debug)]
-enum NvidiaPathResolveError {
-    #[error("Error with nvidia_gpu_info file. Error: '{error}' Path: '{nvidia_gpu_info_path}'")]
-    NvidiaGpuInfoFileError {
-        nvidia_gpu_info_path: PathBuf,
-        error: std::io::Error,
-    },
-    #[error("Error while parsing device minor: {parse_int_error} at line: '{line}'")]
-    ParseInt {
-        line: String,
-        parse_int_error: std::num::ParseIntError,
-    },
-    #[error("Could not find the Device Minor in the file {nvidia_gpu_info_path:#?}")]
-    DeviceMinorNotPresent { nvidia_gpu_info_path: PathBuf },
-    #[error("nvidia_device file does not exist: {0}")]
-    NvidiaDeviceMissing(PathBuf), // The PathBuf is the nvidia_device_path
-    #[error("Invalid device minor line format: '{line}'")]
-    InvalidDeviceMinorFormat { line: String },
-}
-
-#[instrument]
-fn get_nvidia_device_path(pci_addr: &str) -> Result<PathBuf, NvidiaPathResolveError> {
-    use std::fs;
-    // https://github.com/NVIDIA/open-gpu-kernel-modules/discussions/336
-    let nvidia_gpu_info_path = Path::new("/proc/driver/nvidia/gpus")
-        .join(pci_addr)
-        .join("information");
-
-    let info_file = fs::File::open(&nvidia_gpu_info_path).map_err(|error| {
-        NvidiaPathResolveError::NvidiaGpuInfoFileError {
-            nvidia_gpu_info_path: nvidia_gpu_info_path.clone(),
-            error,
-        }
-    })?;
-
-    let Some(line) = BufReader::new(info_file)
-        .lines()
-        .map_while(|line| line.ok())
-        .find(|line| line.starts_with("Device Minor"))
-    else {
-        return Err(NvidiaPathResolveError::DeviceMinorNotPresent {
-            nvidia_gpu_info_path,
-        });
-    };
-
-    let minor: u32 = line
-        .split(":")
-        .last()
-        .ok_or_else(|| NvidiaPathResolveError::InvalidDeviceMinorFormat { line: line.clone() })?
-        .trim()
-        .parse::<u32>()
-        .map_err(|error| NvidiaPathResolveError::ParseInt {
-            line: line.clone(),
-            parse_int_error: error,
-        })?;
-    let nvidia_device_path = Path::new("/dev").join(format!("nvidia{minor}"));
-
-    if nvidia_device_path.exists() {
-        Ok(nvidia_device_path)
-    } else {
-        Err(NvidiaPathResolveError::NvidiaDeviceMissing(
-            nvidia_device_path,
-        ))
-    }
-}
-
-#[instrument]
-fn get_driver_path(pci_addr: &str) -> Option<PathBuf> {
+#[tracing::instrument()]
+pub fn get_driver_path(pci_addr: &str) -> Option<PathBuf> {
     let driver_path = Path::new("/sys/bus/pci/devices/")
         .join(pci_addr)
         .join("driver");
     match driver_path.canonicalize() {
         Err(error) => {
             warn!(
-                "Error while resolving driver_path: '{}': '{:?}'",
-                driver_path.to_str().unwrap(),
+                "Error while resolving symlinks of driver_path: '{}': '{:?}'",
+                driver_path
+                    .to_str()
+                    .expect("Driver path contains invalid UTF-8"),
                 error
             );
             None
@@ -239,58 +253,40 @@ fn get_driver_path(pci_addr: &str) -> Option<PathBuf> {
     }
 }
 
-#[derive(thiserror::Error, Debug)]
-enum DriDevicePathResolveError {
-    #[error("'/dev/dri/by-path' does not exist")]
-    DriByPathNotPresent,
-    #[error("dri_device while following symlink")]
-    DriDeviceFileError {
-        error: std::io::Error,
-        path: PathBuf,
-    },
-}
+#[tracing::instrument(skip_all)]
+pub fn unbind_gpu_from_kwin(device: &PCIDevice) -> Result<(), Error> {
+    use std::fs;
 
-#[instrument]
-#[logfn(err = "Warn")]
-fn get_dri_device_path(pci_addr: &str) -> Result<PathBuf, DriDevicePathResolveError> {
-    let dri_path = Path::new("/dev/dri/by-path");
-    if !dri_path.exists() {
-        return Err(DriDevicePathResolveError::DriByPathNotPresent);
+    let dri_device_path =
+        device
+            .dri_device_path
+            .as_ref()
+            .ok_or_else(|| Error::DriDevicePathNotFound {
+                pci_addr: device.pci_addr.clone(),
+            })?;
+
+    let path = Path::new("/sys/bus/pci/devices/")
+        .join(&device.pci_addr)
+        .join("drm")
+        .join(
+            dri_device_path
+                .file_name()
+                .expect("DRI device path missing filename component"),
+        )
+        .join("uevent");
+
+    if !path.exists() {
+        return Err(Error::DrmUeventPathNotFound {
+            path: path.clone(),
+            pci_addr: device.pci_addr.clone(),
+        });
     }
 
-    dri_path
-        .join(format!("pci-{pci_addr}-card"))
-        .canonicalize()
-        .map_err(|error| DriDevicePathResolveError::DriDeviceFileError {
-            error,
-            path: dri_path.join(format!("pci-{pci_addr}-card")),
-        })
-}
+    fs::write(&path, "remove").map_err(|error| Error::FailedToWriteToUeventFile {
+        path: path.clone(),
+        content: "remove".to_string(),
+        io_error: error,
+    })?;
 
-#[derive(thiserror::Error, Debug)]
-enum DriRenderPathResolveError {
-    #[error("'/dev/dri/by-path' does not exist")]
-    DriByPathNotPresent,
-    #[error("dri_render while following symlink")]
-    DriRenderFileError {
-        error: std::io::Error,
-        path: PathBuf,
-    },
-}
-
-#[instrument]
-#[logfn(err = "Warn")]
-fn get_dri_render_path(pci_addr: &str) -> Result<PathBuf, DriRenderPathResolveError> {
-    let dri_path = Path::new("/dev/dri/by-path");
-    if !dri_path.exists() {
-        return Err(DriRenderPathResolveError::DriByPathNotPresent);
-    }
-
-    dri_path
-        .join(format!("pci-{pci_addr}-render"))
-        .canonicalize()
-        .map_err(|error| DriRenderPathResolveError::DriRenderFileError {
-            error,
-            path: dri_path.join(format!("pci-{pci_addr}-render")),
-        })
+    Ok(())
 }

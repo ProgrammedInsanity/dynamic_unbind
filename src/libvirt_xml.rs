@@ -1,9 +1,8 @@
+use crate::pci_device;
+
 use log::{error, warn};
 use serde::Deserialize;
-use std::clone;
-
-use crate::pci_device;
-// I am just going ignore the possibility of attributes or nodes missing and causing a error
+// I am just going to ignore the possibility of attributes or nodes missing and causing an error
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DriverFinderOnShutdownMethod {
@@ -17,98 +16,174 @@ pub enum DriverFinderOnShutdownMethod {
 
 #[derive(Debug, Deserialize)]
 struct Domain {
-    pub devices: Devices,
-    pub metadata: Metadata,
+    devices: Devices,
+    metadata: Metadata,
+    #[serde(rename = "uuid")]
+    uuid: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct Devices {
     #[serde(rename = "hostdev")]
-    pub hostdevs: Vec<HostDev>,
+    hostdevs: Option<Vec<HostDev>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct HostDev {
+    #[allow(unused)]
     #[serde(rename = "@mode")]
-    pub mode: String,
+    mode: String,
 
+    #[allow(unused)]
     #[serde(rename = "@type")]
-    pub device_type: String,
+    device_type: String,
 
+    #[allow(unused)]
     #[serde(rename = "@managed")]
-    pub managed: String,
+    managed: String,
 
-    pub source: Source,
+    source: Source,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Source {
-    pub address: Address,
+    address: Address,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Address {
     #[serde(rename = "@domain")]
-    pub domain: String,
+    domain: String,
 
     #[serde(rename = "@bus")]
-    pub bus: String,
+    bus: String,
 
     #[serde(rename = "@slot")]
-    pub slot: String,
+    slot: String,
 
     #[serde(rename = "@function")]
-    pub function: String,
+    function: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct Metadata {
     #[serde(rename = "dyn:dynamic_unbind")]
-    pub dynamic_unbind: DynamicUnbind,
+    dynamic_unbind: DynamicUnbind,
 }
 
 #[derive(Debug, Deserialize)]
 struct DynamicUnbind {
     #[serde(rename = "pci_device")]
-    pub pci_devices: Vec<PciDevice>,
+    pci_devices: Vec<PciDevice>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct PciDevice {
     #[serde(rename = "@domain")]
-    pub domain: String,
+    domain: String,
 
     #[serde(rename = "@bus")]
-    pub bus: String,
+    bus: String,
 
     #[serde(rename = "@slot")]
-    pub slot: String,
+    slot: String,
 
     #[serde(rename = "@function")]
-    pub function: String,
+    function: String,
 
     #[serde(rename = "@driver_finder_on_shutdown_method")]
-    pub driver_finder_on_shutdown_method: DriverFinderOnShutdownMethod,
+    driver_finder_on_shutdown_method: DriverFinderOnShutdownMethod,
 
     #[serde(rename = "@driver")]
-    pub driver: Option<String>,
+    driver: Option<String>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Failed to parse XML: {0}")]
+    SerdeFailedToParse(#[from] serde_xml_rs::Error),
+    #[error(
+        "PCI device {pci_addr} has driver_finder_on_shutdown_method set to 'user-specified' but no driver specified"
+    )]
+    UserSpecifiedButNoDriverSpecified { pci_addr: String },
+    #[error("Duplicate configs for one PCI device: '{configs:#?}'")]
+    DuplicateConfigsForPCIDevice { configs: Vec<PciDevice> },
+    #[error("Failed to create PCI device: {0}")]
+    FailedToCreatePCIDevice(#[from] crate::pci_device::Error),
+    #[error("User-specified driver '{driver}' for PCI device: \"{pci_addr}\" does not exist")]
+    UserSpecifiedDriverDoesNotExist { pci_addr: String, driver: String },
+}
+
+pub struct XMLData {
+    raw: Domain,
+    pci_devices: Vec<pci_device::PCIDevice>,
+}
+
+impl XMLData {
+    pub fn new(xml: &str) -> Result<Self, Error> {
+        let parsed_xml = serde_xml_rs::from_str::<Domain>(xml)?;
+        let pci_devices = retrieve_pci_devices_from_parsed_xml(&parsed_xml)?;
+        Ok(XMLData {
+            raw: parsed_xml,
+            pci_devices,
+        })
+    }
+
+    pub fn get_vm_uuid(&self) -> &str {
+        &self.raw.uuid
+    }
+
+    pub fn get_pci_devices(&self) -> &Vec<pci_device::PCIDevice> {
+        &self.pci_devices
+    }
 }
 
 #[tracing::instrument(skip_all)]
-pub fn parse_xml_and_retrieve_pci_devices(xml: &str) -> Vec<pci_device::PCIDevice> {
-    let xml = match serde_xml_rs::from_str::<Domain>(xml) {
-        Ok(xml) => xml,
-        Err(error) => {
-            panic!("Failed to parse XML(Please read the documentation): {error}")
+fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::PCIDevice>, Error> {
+    for pci_device in &xml.metadata.dynamic_unbind.pci_devices {
+        let pci_addr = format!(
+            "{}:{}:{}.{}",
+            pci_device
+                .domain
+                .strip_prefix("0x")
+                .unwrap_or(&pci_device.domain),
+            pci_device.bus.strip_prefix("0x").unwrap_or(&pci_device.bus),
+            pci_device
+                .slot
+                .strip_prefix("0x")
+                .unwrap_or(&pci_device.slot),
+            pci_device
+                .function
+                .strip_prefix("0x")
+                .unwrap_or(&pci_device.function)
+        );
+        if pci_device.driver_finder_on_shutdown_method
+            == DriverFinderOnShutdownMethod::UserSpecified
+            && pci_device.driver.is_none()
+        {
+            return Err(Error::UserSpecifiedButNoDriverSpecified { pci_addr });
         }
-    };
 
-    // What a mess
-    xml.devices
+        if pci_device.driver_finder_on_shutdown_method
+            == DriverFinderOnShutdownMethod::UserSpecified
+            && let Some(user_specified_driver) = &pci_device.driver
+            && !crate::kernel_modules::kmod_exists(user_specified_driver)
+        {
+            return Err(Error::UserSpecifiedDriverDoesNotExist {
+                pci_addr,
+                driver: user_specified_driver.clone(),
+            });
+        }
+    }
+
+    // What a mess, it is so cursed that rust won't format it anymore.
+    Ok(xml
+        .devices
         .hostdevs
+        .as_ref()
+        .unwrap_or(&vec![])
         .iter()
-        .filter(|host_dev| host_dev.managed == "no")
-        .flat_map(|host_dev| {
+        .map(|host_dev| {
             let configs = xml
                 .metadata
                 .dynamic_unbind
@@ -126,35 +201,78 @@ pub fn parse_xml_and_retrieve_pci_devices(xml: &str) -> Vec<pci_device::PCIDevic
 
             match configs.len() {
                 0 => {
-                    warn!("No configuration found for PCI device {}:{}:{}.{} in metadata section",
-                        host_dev.source.address.domain.strip_prefix("0x").unwrap(),
-                        host_dev.source.address.bus.strip_prefix("0x").unwrap(),
-                        host_dev.source.address.slot.strip_prefix("0x").unwrap(),
-                        host_dev.source.address.function.strip_prefix("0x").unwrap()
+                    warn!(
+                        "No configuration found for PCI device {}:{}:{}.{} in metadata section",
+                        host_dev
+                            .source
+                            .address
+                            .domain
+                            .strip_prefix("0x")
+                            .expect("Domain missing 0x prefix"),
+                        host_dev
+                            .source
+                            .address
+                            .bus
+                            .strip_prefix("0x")
+                            .expect("Bus missing 0x prefix"),
+                        host_dev
+                            .source
+                            .address
+                            .slot
+                            .strip_prefix("0x")
+                            .expect("Slot missing 0x prefix"),
+                        host_dev
+                            .source
+                            .address
+                            .function
+                            .strip_prefix("0x")
+                            .expect("Function missing 0x prefix")
                     );
-                    None
+                    Ok(None)
                 }
-                1 => {
-                    Some((host_dev, configs.first().unwrap().clone()))
-                }
-                _ => {
-                    error!("Error while parsing xml: Duplicate configs for one pci device: '{configs:#?}'",);
-                    std::process::exit(1);
-                }
+                1 => Ok(Some((
+                    host_dev,
+                    configs
+                        .first()
+                        .expect("Missing PCI device configuration entry")
+                        .clone(),
+                ))),
+                _ => Err(Error::DuplicateConfigsForPCIDevice { configs }),
             }
         })
+        .try_collect::<Vec<Option<(&HostDev, PciDevice)>>>()?
+        .iter()
+        .flatten()
         .map(|pair| {
             pci_device::PCIDevice::new(
                 format!(
                     "{}:{}:{}.{}",
-                    pair.1.domain.strip_prefix("0x").unwrap(),
-                    pair.1.bus.strip_prefix("0x").unwrap(),
-                    pair.1.slot.strip_prefix("0x").unwrap(),
-                    pair.1.function.strip_prefix("0x").unwrap()
+                    pair.1
+                        .domain
+                        .strip_prefix("0x")
+                        .expect("Domain missing 0x prefix in metadata"),
+                    pair.1
+                        .bus
+                        .strip_prefix("0x")
+                        .expect("Bus missing 0x prefix in metadata"),
+                    pair.1
+                        .slot
+                        .strip_prefix("0x")
+                        .expect("Slot missing 0x prefix in metadata"),
+                    pair.1
+                        .function
+                        .strip_prefix("0x")
+                        .expect("Function missing 0x prefix in metadata"),
                 ),
-                pair.1.driver,
+                pair.1.driver.clone(),
                 pair.1.driver_finder_on_shutdown_method,
             )
         })
-        .collect()
+        .try_collect()?)
+}
+
+pub fn retrieve_uuid_from_xml(xml: &str) -> String {
+    serde_xml_rs::from_str::<Domain>(xml)
+        .expect("Failed to parse xml config")
+        .uuid
 }

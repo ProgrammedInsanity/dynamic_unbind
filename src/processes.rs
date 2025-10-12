@@ -5,18 +5,25 @@ use tracing::instrument;
 
 use procfs::process::{FDTarget, all_processes};
 
-/// Error means that the that target_file does not exist.
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Could not kill these processes: {processes:#?}")]
+    CouldNotKillAllProcesses { processes: Vec<u32> },
+}
+
+/// Error means that the target_file does not exist.
 #[instrument]
 #[logfn(err = "Error")]
-pub fn get_pids_via_procfs(target_file: &Path) -> anyhow::Result<Vec<sysinfo::Pid>> {
+fn get_pids_via_procfs(target_file: &Path) -> anyhow::Result<Vec<sysinfo::Pid>> {
     let absolute_target_file = target_file.canonicalize()?;
     Ok(all_processes()
-        .unwrap()
+        .expect("Failed to iterate /proc processes")
         .filter_map(|proc| {
             let proc = proc.ok()?;
             proc.fd()
                 .ok()?
-                .any(|fd| match fd.unwrap().target {
+                .flatten()
+                .any(|fd| match fd.target {
                     FDTarget::Path(path) => {
                         if let Ok(path) = path.canonicalize()
                             && path == absolute_target_file
@@ -34,11 +41,11 @@ pub fn get_pids_via_procfs(target_file: &Path) -> anyhow::Result<Vec<sysinfo::Pi
 }
 
 #[instrument]
-pub fn kill_processes_using_files(files: &Vec<PathBuf>) {
+pub fn kill_processes_using_files(files: &Vec<&PathBuf>) -> Result<(), Error> {
     use std::thread;
     use std::time::Duration;
     use sysinfo::{Signal, System};
-    let s = System::new_all();
+    let mut s = System::new_all();
 
     let pids: Vec<Pid> = files
         .iter()
@@ -71,13 +78,19 @@ pub fn kill_processes_using_files(files: &Vec<PathBuf>) {
     thread::sleep(Duration::from_secs(3));
 
     // This is for processes that restart after being killed
-    const TRIES: u32 = 15;
+    const TRIES: u32 = 30;
     for try_of_kill in 1..=TRIES {
         let pids: Vec<Pid> = files
             .iter()
             .flat_map(|file| get_pids_via_procfs(file))
             .flatten()
             .collect();
+
+        s.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&pids),
+            true,
+            sysinfo::ProcessRefreshKind::everything().without_tasks(),
+        );
 
         if pids.is_empty() {
             break;
@@ -92,7 +105,9 @@ pub fn kill_processes_using_files(files: &Vec<PathBuf>) {
                     s.process(*pid)
                         .map_or("Could not get name".to_string(), |process| process
                             .name()
-                            .to_string_lossy()
+                            .to_os_string()
+                            .to_str()
+                            .expect("Process name is not valid UTF-8")
                             .to_string())
                 ))
                 .collect::<Vec<String>>()
@@ -105,5 +120,19 @@ pub fn kill_processes_using_files(files: &Vec<PathBuf>) {
             });
 
         thread::sleep(Duration::from_secs(1));
+    }
+
+    let pids: Vec<Pid> = files
+        .iter()
+        .flat_map(|file| get_pids_via_procfs(file))
+        .flatten()
+        .collect();
+
+    if pids.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::CouldNotKillAllProcesses {
+            processes: pids.iter().map(|pid| pid.as_u32()).collect(),
+        })
     }
 }
