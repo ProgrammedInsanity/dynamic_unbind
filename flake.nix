@@ -34,11 +34,12 @@
             LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath dependencies}";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.lib.getDev pkgs.kmod}/include -I${pkgs.lib.getDev pkgs.glibc}/include";
+            RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
           };
 
-          shellHook = ''
-            exec nu
-          '';
+          # shellHook = ''
+          #   exec nu
+          # '';
         };
 
     };
