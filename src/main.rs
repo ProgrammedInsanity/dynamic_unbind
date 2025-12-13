@@ -25,8 +25,8 @@ fn main() {
 
     let _ = dotenvy::from_path("/etc/environment");
 
-    let log_dir = Path::new("/var/log/dynamic_unbind");
-    fs::create_dir_all(log_dir).expect("Failed to create log directory");
+    fs::create_dir_all(Path::new("/var/log/dynamic_unbind"))
+        .expect("Failed to create log directory");
 
     let libvirt_args = parse_libvirt_args();
 
@@ -48,10 +48,11 @@ fn main() {
         &libvirt_xml::retrieve_uuid_from_xml(&libvirt_args.xml_config),
     );
 
-    let xml_data = libvirt_xml::XMLData::new(&libvirt_args.xml_config).unwrap_or_else(|error| {
-        error!("Failed to init XMLData: {error}");
-        std::process::exit(1)
-    });
+    let xml_data =
+        libvirt_xml::VMConfiguration::new(&libvirt_args.xml_config).unwrap_or_else(|error| {
+            error!("Failed to init XMLData: {error}");
+            std::process::exit(1)
+        });
 
     match (
         libvirt_args.operation.as_str(),
@@ -118,7 +119,7 @@ fn parse_libvirt_args() -> LibvirtArgs {
 }
 
 #[tracing::instrument(skip_all)]
-fn begin(xml_data: &libvirt_xml::XMLData, libvirt_args: &LibvirtArgs) {
+fn begin(xml_data: &libvirt_xml::VMConfiguration, libvirt_args: &LibvirtArgs) {
     if !kernel_modules::kmod_loaded("vfio_pci") {
         info!("Kernel module 'vfio_pci' not loaded; attempting to load it");
         match kernel_modules::load_kmod("vfio_pci") {
@@ -221,7 +222,7 @@ fn begin(xml_data: &libvirt_xml::XMLData, libvirt_args: &LibvirtArgs) {
 }
 
 #[tracing::instrument(skip_all)]
-fn end(xml_data: &libvirt_xml::XMLData, libvirt_args: &LibvirtArgs) {
+fn end(xml_data: &libvirt_xml::VMConfiguration, libvirt_args: &LibvirtArgs) {
     use libvirt_xml::DriverFinderOnShutdownMethod;
 
     for device in xml_data.get_pci_devices().iter().filter(|pci_device| {

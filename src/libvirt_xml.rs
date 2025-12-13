@@ -38,7 +38,6 @@ struct HostDev {
     #[serde(rename = "@type")]
     device_type: String,
 
-    #[allow(unused)]
     #[serde(rename = "@managed")]
     managed: String,
 
@@ -68,7 +67,7 @@ struct Address {
 #[derive(Debug, Deserialize)]
 struct Metadata {
     #[serde(rename = "dyn:dynamic_unbind")]
-    dynamic_unbind: DynamicUnbind,
+    dynamic_unbind: Option<DynamicUnbind>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,16 +113,16 @@ pub enum Error {
     UserSpecifiedDriverDoesNotExist { pci_addr: String, driver: String },
 }
 
-pub struct XMLData {
+pub struct VMConfiguration {
     raw: Domain,
     pci_devices: Vec<pci_device::PCIDevice>,
 }
 
-impl XMLData {
+impl VMConfiguration {
     pub fn new(xml: &str) -> Result<Self, Error> {
         let parsed_xml = serde_xml_rs::from_str::<Domain>(xml)?;
         let pci_devices = retrieve_pci_devices_from_parsed_xml(&parsed_xml)?;
-        Ok(XMLData {
+        Ok(VMConfiguration {
             raw: parsed_xml,
             pci_devices,
         })
@@ -139,136 +138,141 @@ impl XMLData {
 }
 
 #[tracing::instrument(skip_all)]
-fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::PCIDevice>, Error> {
-    for pci_device in &xml.metadata.dynamic_unbind.pci_devices {
-        let pci_addr = format!(
-            "{}:{}:{}.{}",
-            pci_device
-                .domain
-                .strip_prefix("0x")
-                .unwrap_or(&pci_device.domain),
-            pci_device.bus.strip_prefix("0x").unwrap_or(&pci_device.bus),
-            pci_device
-                .slot
-                .strip_prefix("0x")
-                .unwrap_or(&pci_device.slot),
-            pci_device
-                .function
-                .strip_prefix("0x")
-                .unwrap_or(&pci_device.function)
-        );
-        if pci_device.driver_finder_on_shutdown_method
-            == DriverFinderOnShutdownMethod::UserSpecified
-            && pci_device.driver.is_none()
-        {
-            return Err(Error::UserSpecifiedButNoDriverSpecified { pci_addr });
-        }
+fn retrieve_pci_devices_from_parsed_xml(
+    xml: &Domain,
+) -> Result<Vec<pci_device::PCIDevice>, Error> {
+    let Some(dynamic_devices) = &xml.metadata.dynamic_unbind else {
+        return Ok(vec![]);
+    };
 
-        if pci_device.driver_finder_on_shutdown_method
-            == DriverFinderOnShutdownMethod::UserSpecified
-            && let Some(user_specified_driver) = &pci_device.driver
-            && !crate::kernel_modules::kmod_exists(user_specified_driver)
-        {
-            return Err(Error::UserSpecifiedDriverDoesNotExist {
-                pci_addr,
-                driver: user_specified_driver.clone(),
-            });
+    let Some(hostdevs) = &xml.devices.hostdevs else {
+        return Ok(vec![]);
+    };
+
+    Ok(hostdevs
+        .iter()
+        .filter(|host_dev| host_dev.managed == "no")
+        .map(|host_dev| find_dynamic_device_for_hostdev(host_dev, &dynamic_devices.pci_devices))
+        .try_collect::<Vec<Option<pci_device::PCIDevice>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+#[tracing::instrument(skip_all)]
+fn find_dynamic_device_for_hostdev(
+    host_dev: &HostDev,
+    dynamic_devices: &[PciDevice],
+) -> Result<Option<pci_device::PCIDevice>, Error> {
+    let configs = dynamic_devices
+        .iter()
+        .filter(|pci_device| {
+            let host_dev_addr = &host_dev.source.address;
+            host_dev_addr.domain == pci_device.domain
+                && host_dev_addr.bus == pci_device.bus
+                && host_dev_addr.slot == pci_device.slot
+                && host_dev_addr.function == pci_device.function
+        })
+        .map(PciDevice::clone)
+        .collect::<Vec<PciDevice>>();
+
+    match configs.len() {
+        0 => {
+            warn!(
+                "No configuration found for PCI device {}:{}:{}.{} in metadata section",
+                host_dev
+                    .source
+                    .address
+                    .domain
+                    .strip_prefix("0x")
+                    .expect("Domain missing 0x prefix"),
+                host_dev
+                    .source
+                    .address
+                    .bus
+                    .strip_prefix("0x")
+                    .expect("Bus missing 0x prefix"),
+                host_dev
+                    .source
+                    .address
+                    .slot
+                    .strip_prefix("0x")
+                    .expect("Slot missing 0x prefix"),
+                host_dev
+                    .source
+                    .address
+                    .function
+                    .strip_prefix("0x")
+                    .expect("Function missing 0x prefix")
+            );
+            return Ok(None);
         }
+        1 => {}
+        _ => return Err(Error::DuplicateConfigsForPCIDevice { configs }),
+    };
+
+    let dynamic_device = configs.first().unwrap();
+
+    let pci_addr = format!(
+        "{}:{}:{}.{}",
+        dynamic_device
+            .domain
+            .strip_prefix("0x")
+            .unwrap_or(&host_dev.source.address.domain),
+        dynamic_device
+            .bus
+            .strip_prefix("0x")
+            .unwrap_or(&host_dev.source.address.bus),
+        dynamic_device
+            .slot
+            .strip_prefix("0x")
+            .unwrap_or(&host_dev.source.address.slot),
+        dynamic_device
+            .function
+            .strip_prefix("0x")
+            .unwrap_or(&host_dev.source.address.function)
+    );
+    if dynamic_device.driver_finder_on_shutdown_method
+        == DriverFinderOnShutdownMethod::UserSpecified
+        && dynamic_device.driver.is_none()
+    {
+        return Err(Error::UserSpecifiedButNoDriverSpecified { pci_addr });
     }
 
-    // What a mess, it is so cursed that rust won't format it anymore.
-    Ok(xml
-        .devices
-        .hostdevs
-        .as_ref()
-        .unwrap_or(&vec![])
-        .iter()
-        .map(|host_dev| {
-            let configs = xml
-                .metadata
-                .dynamic_unbind
-                .pci_devices
-                .iter()
-                .filter(|pci_device| {
-                    let host_dev_addr = &host_dev.source.address;
-                    host_dev_addr.domain == pci_device.domain
-                        && host_dev_addr.bus == pci_device.bus
-                        && host_dev_addr.slot == pci_device.slot
-                        && host_dev_addr.function == pci_device.function
-                })
-                .map(PciDevice::clone)
-                .collect::<Vec<PciDevice>>();
+    if dynamic_device.driver_finder_on_shutdown_method
+        == DriverFinderOnShutdownMethod::UserSpecified
+        && let Some(user_specified_driver) = &dynamic_device.driver
+        && !crate::kernel_modules::kmod_exists(user_specified_driver)
+    {
+        return Err(Error::UserSpecifiedDriverDoesNotExist {
+            pci_addr,
+            driver: user_specified_driver.clone(),
+        });
+    }
 
-            match configs.len() {
-                0 => {
-                    warn!(
-                        "No configuration found for PCI device {}:{}:{}.{} in metadata section",
-                        host_dev
-                            .source
-                            .address
-                            .domain
-                            .strip_prefix("0x")
-                            .expect("Domain missing 0x prefix"),
-                        host_dev
-                            .source
-                            .address
-                            .bus
-                            .strip_prefix("0x")
-                            .expect("Bus missing 0x prefix"),
-                        host_dev
-                            .source
-                            .address
-                            .slot
-                            .strip_prefix("0x")
-                            .expect("Slot missing 0x prefix"),
-                        host_dev
-                            .source
-                            .address
-                            .function
-                            .strip_prefix("0x")
-                            .expect("Function missing 0x prefix")
-                    );
-                    Ok(None)
-                }
-                1 => Ok(Some((
-                    host_dev,
-                    configs
-                        .first()
-                        .expect("Missing PCI device configuration entry")
-                        .clone(),
-                ))),
-                _ => Err(Error::DuplicateConfigsForPCIDevice { configs }),
-            }
-        })
-        .try_collect::<Vec<Option<(&HostDev, PciDevice)>>>()?
-        .iter()
-        .flatten()
-        .map(|pair| {
-            pci_device::PCIDevice::new(
-                format!(
-                    "{}:{}:{}.{}",
-                    pair.1
-                        .domain
-                        .strip_prefix("0x")
-                        .expect("Domain missing 0x prefix in metadata"),
-                    pair.1
-                        .bus
-                        .strip_prefix("0x")
-                        .expect("Bus missing 0x prefix in metadata"),
-                    pair.1
-                        .slot
-                        .strip_prefix("0x")
-                        .expect("Slot missing 0x prefix in metadata"),
-                    pair.1
-                        .function
-                        .strip_prefix("0x")
-                        .expect("Function missing 0x prefix in metadata"),
-                ),
-                pair.1.driver.clone(),
-                pair.1.driver_finder_on_shutdown_method,
-            )
-        })
-        .try_collect()?)
+    Ok(Some(pci_device::PCIDevice::new(
+        format!(
+            "{}:{}:{}.{}",
+            dynamic_device
+                .domain
+                .strip_prefix("0x")
+                .expect("Domain missing 0x prefix in metadata"),
+            dynamic_device
+                .bus
+                .strip_prefix("0x")
+                .expect("Bus missing 0x prefix in metadata"),
+            dynamic_device
+                .slot
+                .strip_prefix("0x")
+                .expect("Slot missing 0x prefix in metadata"),
+            dynamic_device
+                .function
+                .strip_prefix("0x")
+                .expect("Function missing 0x prefix in metadata"),
+        ),
+        dynamic_device.driver.clone(),
+        dynamic_device.driver_finder_on_shutdown_method,
+    )?))
 }
 
 pub fn retrieve_uuid_from_xml(xml: &str) -> String {
