@@ -138,11 +138,11 @@ impl VMConfiguration {
 }
 
 #[tracing::instrument(skip_all)]
-fn retrieve_pci_devices_from_parsed_xml(
-    xml: &Domain,
-) -> Result<Vec<pci_device::PCIDevice>, Error> {
-    let Some(dynamic_devices) = &xml.metadata.dynamic_unbind else {
-        return Ok(vec![]);
+fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::PCIDevice>, Error> {
+    let dynamic_devices = if let Some(dynamic_devices) = &xml.metadata.dynamic_unbind {
+        &dynamic_devices.pci_devices
+    } else {
+        &vec![]
     };
 
     let Some(hostdevs) = &xml.devices.hostdevs else {
@@ -152,7 +152,7 @@ fn retrieve_pci_devices_from_parsed_xml(
     Ok(hostdevs
         .iter()
         .filter(|host_dev| host_dev.managed == "no")
-        .map(|host_dev| find_dynamic_device_for_hostdev(host_dev, &dynamic_devices.pci_devices))
+        .map(|host_dev| find_dynamic_device_for_hostdev(host_dev, dynamic_devices))
         .try_collect::<Vec<Option<pci_device::PCIDevice>>>()?
         .into_iter()
         .flatten()
