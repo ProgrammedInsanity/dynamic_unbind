@@ -73,5 +73,11 @@ pub fn setup_logging(args: &LibvirtArgs, vm_uuid: &str) {
         default_hook(panic_info);
     }));
 
-    info!("Log file: {}", log_file_path.display())
+    use sha2::{Digest, Sha256};
+    use std::fs;
+
+    let binary_hash = Sha256::digest(fs::read("/proc/self/exe").unwrap());
+    let binary_hash = hex::encode(binary_hash);
+    info!("Log file: {}", log_file_path.display());
+    info!("binary hash: {}", binary_hash);
 }

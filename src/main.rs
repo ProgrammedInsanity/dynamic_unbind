@@ -147,6 +147,10 @@ fn begin(xml_data: &libvirt_xml::VMConfiguration, libvirt_args: &LibvirtArgs) {
         std::process::exit(1);
     };
 
+    if xml_data.get_pci_devices().is_empty() {
+        warn!("No pci devices specified");
+    }
+
     for device in xml_data.get_pci_devices() {
         info!("Processing PCI device {}", device.pci_addr);
         if let Some(path) = &device.dri_device_path

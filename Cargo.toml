@@ -21,5 +21,7 @@ kmod-sys = "0.2.0"
 dotenvy = "0.15.7"
 tracing-journald = "0.3.1"
 serde_json = "1.0.145"
+sha2 = "0.11.0"
+hex = "0.4.3"
 
 

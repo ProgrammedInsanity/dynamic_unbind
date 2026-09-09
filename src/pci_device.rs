@@ -113,6 +113,7 @@ impl PCIDevice {
             && let Some(ref user_driver) = user_specified_driver
             && !kernel_modules::kmod_exists(user_driver)
         {
+            warn!("user specified driver does not exist {pci_addr}: {user_driver}");
             return Err(Error::UserSpecifiedDriverDoesNotExist {
                 driver: user_driver.clone(),
             });
