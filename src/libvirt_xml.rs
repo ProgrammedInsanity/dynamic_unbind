@@ -46,7 +46,7 @@ struct HostDev {
 
 #[derive(Debug, Deserialize, Clone)]
 struct Source {
-    address: Address,
+    address: Option<Address>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -151,7 +151,7 @@ fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::
 
     Ok(hostdevs
         .iter()
-        .filter(|host_dev| host_dev.managed == "no")
+        .filter(|host_dev| host_dev.managed == "no" && host_dev.source.address.is_some())
         .map(|host_dev| find_dynamic_device_for_hostdev(host_dev, dynamic_devices))
         .try_collect::<Vec<Option<pci_device::PCIDevice>>>()?
         .into_iter()
@@ -168,10 +168,10 @@ fn find_dynamic_device_for_hostdev(
         .iter()
         .filter(|pci_device| {
             let host_dev_addr = &host_dev.source.address;
-            host_dev_addr.domain == pci_device.domain
-                && host_dev_addr.bus == pci_device.bus
-                && host_dev_addr.slot == pci_device.slot
-                && host_dev_addr.function == pci_device.function
+            host_dev_addr.as_ref().unwrap().domain == pci_device.domain
+                && host_dev_addr.as_ref().unwrap().bus == pci_device.bus
+                && host_dev_addr.as_ref().unwrap().slot == pci_device.slot
+                && host_dev_addr.as_ref().unwrap().function == pci_device.function
         })
         .map(PciDevice::clone)
         .collect::<Vec<PciDevice>>();
@@ -183,24 +183,32 @@ fn find_dynamic_device_for_hostdev(
                 host_dev
                     .source
                     .address
+                    .as_ref()
+                    .unwrap()
                     .domain
                     .strip_prefix("0x")
                     .expect("Domain missing 0x prefix"),
                 host_dev
                     .source
                     .address
+                    .as_ref()
+                    .unwrap()
                     .bus
                     .strip_prefix("0x")
                     .expect("Bus missing 0x prefix"),
                 host_dev
                     .source
                     .address
+                    .as_ref()
+                    .unwrap()
                     .slot
                     .strip_prefix("0x")
                     .expect("Slot missing 0x prefix"),
                 host_dev
                     .source
                     .address
+                    .as_ref()
+                    .unwrap()
                     .function
                     .strip_prefix("0x")
                     .expect("Function missing 0x prefix")
@@ -218,19 +226,19 @@ fn find_dynamic_device_for_hostdev(
         dynamic_device
             .domain
             .strip_prefix("0x")
-            .unwrap_or(&host_dev.source.address.domain),
+            .unwrap_or(&host_dev.source.address.as_ref().unwrap().domain),
         dynamic_device
             .bus
             .strip_prefix("0x")
-            .unwrap_or(&host_dev.source.address.bus),
+            .unwrap_or(&host_dev.source.address.as_ref().unwrap().bus),
         dynamic_device
             .slot
             .strip_prefix("0x")
-            .unwrap_or(&host_dev.source.address.slot),
+            .unwrap_or(&host_dev.source.address.as_ref().unwrap().slot),
         dynamic_device
             .function
             .strip_prefix("0x")
-            .unwrap_or(&host_dev.source.address.function)
+            .unwrap_or(&host_dev.source.address.as_ref().unwrap().function)
     );
     if dynamic_device.driver_finder_on_shutdown_method
         == DriverFinderOnShutdownMethod::UserSpecified
