@@ -356,4 +356,10 @@ fn load_driver_for_device(driver_name: &str, device: &pci_device::PCIDevice) {
             std::process::exit(1);
         });
     }
+
+    if driver_name == "nvidia" {
+        if let Err(error) = kernel_modules::load_kmod("nvidia_uvm") {
+            warn!("Failed to restore NVIDIA CUDA support: {error}");
+        }
+    }
 }
