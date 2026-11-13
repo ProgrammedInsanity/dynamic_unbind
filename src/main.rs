@@ -54,6 +54,10 @@ fn main() {
             std::process::exit(1)
         });
 
+    if xml_data.get_pci_devices().is_empty() {
+        warn!("No dynamic pci devices were defined")
+    }
+
     match (
         libvirt_args.operation.as_str(),
         libvirt_args.sub_operation.as_str(),

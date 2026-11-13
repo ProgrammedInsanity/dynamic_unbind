@@ -105,12 +105,17 @@ pub enum Error {
         "PCI device {pci_addr} has driver_finder_on_shutdown_method set to 'user-specified' but no driver specified"
     )]
     UserSpecifiedButNoDriverSpecified { pci_addr: String },
-    #[error("Duplicate configs for one PCI device: '{configs:#?}'")]
-    DuplicateConfigsForPCIDevice { configs: Vec<PciDevice> },
+    #[error("Duplicate configs for these PCI devices: '{configs:#?}'")]
+    DuplicateConfigsForPCIDevicess { configs: Vec<PciDevice> },
     #[error("Failed to create PCI device: {0}")]
     FailedToCreatePCIDevice(#[from] crate::pci_device::Error),
     #[error("User-specified driver '{driver}' for PCI device: \"{pci_addr}\" does not exist")]
     UserSpecifiedDriverDoesNotExist { pci_addr: String, driver: String },
+    #[error("A host device ({host_dev:#?}) was found for dynamic device {dynamic_device:#?} but managed is \"yes\". Set managed to \"no\" to let dynamic unbind manage that device")]
+    HostDeviceManagedByLibvirt {
+        host_dev: Source,
+        dynamic_device: PciDevice,
+    },
 }
 
 pub struct VMConfiguration {
@@ -145,14 +150,35 @@ fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::
         &vec![]
     };
 
+    let duplicates = dynamic_devices
+        .iter()
+        .map(|dyn_device| {
+            dynamic_devices
+                .iter()
+                .filter(|dyn_device_inner| {
+                    dyn_device.domain == dyn_device_inner.domain
+                        && dyn_device.bus == dyn_device_inner.bus
+                        && dyn_device.slot == dyn_device_inner.slot
+                        && dyn_device.function == dyn_device_inner.function
+                })
+                .collect::<Vec<&PciDevice>>()
+        })
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<Vec<&PciDevice>>>();
+
+    if !duplicates.is_empty() {
+        return Err(Error::DuplicateConfigsForPCIDevicess {
+            configs: duplicates.iter().map(|group| group[0].clone()).collect(),
+        });
+    }
+
     let Some(hostdevs) = &xml.devices.hostdevs else {
         return Ok(vec![]);
     };
 
-    Ok(hostdevs
+    Ok(dynamic_devices
         .iter()
-        .filter(|host_dev| host_dev.managed == "no" && host_dev.source.address.is_some())
-        .map(|host_dev| find_dynamic_device_for_hostdev(host_dev, dynamic_devices))
+        .map(|dyn_device| find_hostdev_for_dyn_device(dyn_device, hostdevs))
         .try_collect::<Vec<Option<pci_device::PCIDevice>>>()?
         .into_iter()
         .flatten()
@@ -160,55 +186,39 @@ fn retrieve_pci_devices_from_parsed_xml(xml: &Domain) -> Result<Vec<pci_device::
 }
 
 #[tracing::instrument(skip_all)]
-fn find_dynamic_device_for_hostdev(
-    host_dev: &HostDev,
-    dynamic_devices: &[PciDevice],
+fn find_hostdev_for_dyn_device(
+    dynamic_device: &PciDevice,
+    hostdevs: &[HostDev],
 ) -> Result<Option<pci_device::PCIDevice>, Error> {
-    let configs = dynamic_devices
+    let configs = hostdevs
         .iter()
-        .filter(|pci_device| {
-            let host_dev_addr = &host_dev.source.address;
-            host_dev_addr.as_ref().unwrap().domain == pci_device.domain
-                && host_dev_addr.as_ref().unwrap().bus == pci_device.bus
-                && host_dev_addr.as_ref().unwrap().slot == pci_device.slot
-                && host_dev_addr.as_ref().unwrap().function == pci_device.function
+        .filter(|host_dev| {
+            host_dev.source.address.is_some()
+                && host_dev.source.address.as_ref().unwrap().domain == dynamic_device.domain
+                && host_dev.source.address.as_ref().unwrap().bus == dynamic_device.bus
+                && host_dev.source.address.as_ref().unwrap().slot == dynamic_device.slot
+                && host_dev.source.address.as_ref().unwrap().function == dynamic_device.function
         })
-        .map(PciDevice::clone)
-        .collect::<Vec<PciDevice>>();
+        .map(HostDev::clone)
+        .collect::<Vec<HostDev>>();
 
     match configs.len() {
         0 => {
             warn!(
                 "No configuration found for PCI device {}:{}:{}.{} in metadata section",
-                host_dev
-                    .source
-                    .address
-                    .as_ref()
-                    .unwrap()
+                dynamic_device
                     .domain
                     .strip_prefix("0x")
                     .expect("Domain missing 0x prefix"),
-                host_dev
-                    .source
-                    .address
-                    .as_ref()
-                    .unwrap()
+                dynamic_device
                     .bus
                     .strip_prefix("0x")
                     .expect("Bus missing 0x prefix"),
-                host_dev
-                    .source
-                    .address
-                    .as_ref()
-                    .unwrap()
+                dynamic_device
                     .slot
                     .strip_prefix("0x")
                     .expect("Slot missing 0x prefix"),
-                host_dev
-                    .source
-                    .address
-                    .as_ref()
-                    .unwrap()
+                dynamic_device
                     .function
                     .strip_prefix("0x")
                     .expect("Function missing 0x prefix")
@@ -216,10 +226,16 @@ fn find_dynamic_device_for_hostdev(
             return Ok(None);
         }
         1 => {}
-        _ => return Err(Error::DuplicateConfigsForPCIDevice { configs }),
+        _ => unreachable!(),
     };
 
-    let dynamic_device = configs.first().unwrap();
+    let host_dev = configs.first().unwrap();
+    if host_dev.managed == "yes" {
+        return Err(Error::HostDeviceManagedByLibvirt {
+            host_dev: host_dev.source.clone(),
+            dynamic_device: dynamic_device.clone(),
+        });
+    }
 
     let pci_addr = format!(
         "{}:{}:{}.{}",
